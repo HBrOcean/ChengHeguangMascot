@@ -33,15 +33,27 @@ public sealed class ViewFrame
     /// <summary>收缩延迟（秒）。扩张立即生效，收缩要等这么久，避免动作之间反复缩涨。</summary>
     public const float ShrinkDelay = 1.2f;
 
-    /// <summary>位移补偿的平滑系数（每帧向目标值靠近 25%）。</summary>
-    public const float DriftSmooth = 0.25f;
+    /// <summary>
+    /// 位移补偿的跟随系数 —— 现在是 1（完全跟随）。
+    ///
+    /// 之前用 0.25 平滑，结果是「补偿追不上骨架」：unique 起手那几帧角色还在远处，
+    /// need 比补偿到位时大一倍，窗口被顶起来；等补偿追上，窗口又要缩回去 ——
+    /// 一次动作就是「涨→缩」的来回，肉眼看就是窗口在抖、角色在飘。
+    ///
+    /// 之所以现在敢直接跟随：参照已经从「顶点包围盒中心」换成了「骨骼 worldX 中位数」
+    /// （见 SkeletonModel.BodyAxisX）。包围盒中心会被举剑/披风带偏，一帧能跳几十单位；
+    /// 骨骼中位数在 idle 类动作里每帧只动 0.1~0.2 单位，本身就已经是平滑的，
+    /// 再加平滑只会引入滞后。
+    /// </summary>
+    public const float DriftFollow = 1.0f;
 
     /// <summary>
-    /// 补偿量「归零」时用的系数，比增长快一倍。
-    /// 动作从 unique 切回 idle 时，补偿量还挂在最大位移上；如果也按 25% 慢慢退，
-    /// 角色会被残余补偿推向另一侧，窗口会先撑到两倍再缩回来（实测 125 → 271 DIP）。
+    /// 骨骼中位轴的一阶低通系数。
+    /// 中位数本身已经比包围盒中心稳得多，但个别动作里骨架会有单帧尖峰
+    /// （313703 的 skill1 实测单帧跳 95 单位 ≈ 14 DIP）。先把它滤掉，
+    /// 再拿去做 Drift，角色就不会瞬移。
     /// </summary>
-    public const float DriftRelease = 0.5f;
+    public const float BodySmooth = 0.35f;
 
     /// <summary>触发位移补偿的阈值：偏移超过静态框尺寸的这个比例才补偿。</summary>
     public const float DriftThresholdRatio = 0.08f;
@@ -64,6 +76,12 @@ public sealed class ViewFrame
     private float _seenHalfH;
 
     private float _lastGrowTime;
+
+    /// <summary>平滑后的骨骼中位轴（Drift 的输入）。</summary>
+    private float _bodyXSmoothed;
+
+    /// <summary>是否已经收到过第一帧（第一帧不做平滑，避免起手滞后把窗口顶起来）。</summary>
+    private bool _bodyInited;
 
     public float HalfW { get; private set; }
     public float HalfH { get; private set; }
@@ -99,7 +117,8 @@ public sealed class ViewFrame
     /// </param>
     public ViewFrame((float MinX, float MinY, float MaxX, float MaxY) bounds, float anchorX, float anchorY,
                      (float MinX, float MinY, float MaxX, float MaxY)? driftRefBounds = null,
-                     (float MinX, float MinY, float MaxX, float MaxY)? bodyBounds = null)
+                     (float MinX, float MinY, float MaxX, float MaxY)? bodyBounds = null,
+                     float? bodyCenterX = null, float? driftThresholdX = null)
     {
         _anchorX = anchorX;
         _anchorY = anchorY;
@@ -107,12 +126,15 @@ public sealed class ViewFrame
         _statHalfW = Math.Max(1e-3f, Math.Max(anchorX - bounds.MinX, bounds.MaxX - anchorX));
         _statHalfH = Math.Max(1e-3f, Math.Max(anchorY - bounds.MinY, bounds.MaxY - anchorY));
 
+        // Drift 参照：优先用「待机骨骼中位轴」（SkeletonModel.BodyAxisCenter），
+        // 这样和 ComputeBounds 做位移归一化时用的参照完全一致。
         var centerRef = bodyBounds ?? bounds;
-        _centerX = (centerRef.MinX + centerRef.MaxX) * 0.5f;
+        _centerX = bodyCenterX ?? (centerRef.MinX + centerRef.MaxX) * 0.5f;
         _centerY = (centerRef.MinY + centerRef.MaxY) * 0.5f;
+        _bodyXSmoothed = _centerX;
 
         var refBox = driftRefBounds ?? bounds;
-        _driftThresholdX = Math.Max(0f, (refBox.MaxX - refBox.MinX) * DriftThresholdRatio);
+        _driftThresholdX = driftThresholdX ?? Math.Max(0f, (refBox.MaxX - refBox.MinX) * DriftThresholdRatio);
         _driftThresholdY = Math.Max(0f, (refBox.MaxY - refBox.MinY) * DriftThresholdRatio);
 
         Reset();
@@ -127,6 +149,8 @@ public sealed class ViewFrame
         _seenHalfH = _statHalfH;
         DriftX = 0f;
         DriftY = 0f;
+        _bodyXSmoothed = _centerX;
+        _bodyInited = false;
         _lastGrowTime = 0f;
     }
 
@@ -137,7 +161,8 @@ public sealed class ViewFrame
     /// <param name="now">单调秒数（Stopwatch）。</param>
     /// <param name="fx0">当前帧顶点包围盒（未补偿，模型单位）。</param>
     /// <param name="dynamic">是否允许视框随动作扩张。</param>
-    public void Update(float now, float fx0, float fy0, float fx1, float fy1, bool dynamic)
+    /// <param name="bodyX">骨架横向身体轴（骨骼 worldX 中位数），Drift 的参照；不是顶点包围盒中心。</param>
+    public void Update(float now, float bodyX, float fx0, float fy0, float fx1, float fy1, bool dynamic)
     {
         if (!dynamic)
         {
@@ -149,19 +174,16 @@ public sealed class ViewFrame
             return;
         }
 
-        // 1) 位移补偿：只补「整体位移」，小幅摆动不补（死区），避免角色动作本身被拉走
-        float frameCx = (fx0 + fx1) * 0.5f;
-        float frameCy = (fy0 + fy1) * 0.5f;
+        // 1) 位移补偿：只补「骨架整体的平移」，四肢摆动不补（死区）。
+        //    参照用骨骼中位数而不是包围盒中心 —— 后者会被举剑/披风带偏，
+        //    补偿量跟着抖，表现就是角色在窗口里来回蹭。
+        // 先滤掉骨骼中位轴的单帧尖峰，再做死区判断。
+        // 第一帧直接对齐（换皮肤/首次出帧时，从 0 慢慢爬会把窗口顶起来一次）。
+        if (!_bodyInited) { _bodyXSmoothed = bodyX; _bodyInited = true; }
+        else _bodyXSmoothed += (bodyX - _bodyXSmoothed) * BodySmooth;
+        float targetDriftX = DriftTarget(_centerX - _bodyXSmoothed, _driftThresholdX);
 
-        // 只补水平方向。
-        //   横移是「骨架被甩到很远」（unique 实测偏 -1706 单位），不补就一定出窗；
-        //   纵向的偏移基本来自动作本身（die 躺下、born 落下），补了会把动作拉变形，
-        //   而且高度方向靠视框扩张就能装下，不需要也不应该补。
-        float targetDriftX = DriftTarget(_centerX - frameCx, _driftThresholdX);
-
-        // 目标在减小（角色往中心回来）时退得快一点，避免「过冲 → 窗口反向撑大」
-        float k = Math.Abs(targetDriftX) < Math.Abs(DriftX) ? DriftRelease : DriftSmooth;
-        DriftX += (targetDriftX - DriftX) * k;
+        DriftX += (targetDriftX - DriftX) * DriftFollow;
         DriftY = 0f;
 
         // 2) 补偿后的需求：补偿量直接加在顶点上，所以包围盒整体平移

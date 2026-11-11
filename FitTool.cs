@@ -66,7 +66,7 @@ public static class FitTool
         float halfW = Math.Max(Math.Abs(model.AnchorX - b.MinX), Math.Abs(b.MaxX - model.AnchorX));
         float halfH = Math.Max(Math.Abs(model.AnchorY - b.MinY), Math.Abs(b.MaxY - model.AnchorY));
 
-        var view = new ViewFrame(b, model.AnchorX, model.AnchorY, model.RawBounds, model.BodyBounds);
+        var view = new ViewFrame(b, model.AnchorX, model.AnchorY, model.RawBounds, model.BodyBounds, model.BodyAxisCenter, model.DriftThreshold);
         double inset = Math.Max(12.0, (model.AnchorY - b.MinY) * SimScale + 4.0);
         double winW = halfW * 2 * SimScale * (1 + PetRenderControl.PadX);
         double winH = halfH * 2 * SimScale * (1 + PetRenderControl.PadY) + inset;
@@ -107,6 +107,86 @@ public static class FitTool
     }
 
     /// <summary>
+    /// --shake：逐个动作模拟「idle → 动作 → idle」，量化抖动。
+    ///
+    /// 抖动的两个来源分开量：
+    ///   · 窗口抖 = 动作期间窗口尺寸被改了多少次（2 DIP 死区，与 PetWindow 同口径）
+    ///   · 角色抖 = 位移补偿 DriftX 的总变差（每帧变化量之和，DIP）；变差越大角色越像在飘
+    /// </summary>
+    public static void RunShake(bool allSkins = false)
+    {
+        var usable = SkinCatalog.All.Where(e => e.IsUsable && e.Dir != null).ToList();
+        foreach (var skin in usable)
+        {
+            using var model = new SkeletonModel(
+                Path.Combine(skin.Dir!, skin.Id + ".atlas"),
+                Path.Combine(skin.Dir!, skin.Id + ".skel"));
+
+            var view = new ViewFrame(model.Bounds, model.AnchorX, model.AnchorY, model.RawBounds, model.BodyBounds, model.BodyAxisCenter, model.DriftThreshold);
+            double inset = Math.Max(12.0, (model.AnchorY - model.Bounds.MinY) * SimScale + 4.0);
+
+            Console.WriteLine();
+            Console.WriteLine($"=== 抖动体检 · {skin.Id} {skin.DisplayName} ===");
+            Console.WriteLine("  | 动画 | 窗口resize | 窗口范围(DIP) | Drift总变差(DIP) | Drift单帧最大(DIP) | Drift范围(DIP) |");
+            Console.WriteLine("  |---|---|---|---|---|---|");
+
+            foreach (var animName in model.AnimationNames)
+            {
+                var anim = model.Data.FindAnimation(animName);
+                if (anim == null) continue;
+
+                // 从 idle 建立真实姿势（与运行时 PlayAction 一致）
+                view.Reset();
+                double now = 0;
+                model.SetAnimation(0, "idle", true);
+                int warmSteps = (int)(1.0 / SimDt);
+                for (int i = 0; i < warmSteps; i++)
+                {
+                    model.Update((float)SimDt);
+                    now += SimDt;
+                    var b0 = SkeletonModel.BoxOf(model.Skeleton);
+                    if (b0.HasValue) view.Update((float)now, model.BodyAxisX(), b0.Value.X0, b0.Value.Y0, b0.Value.X1, b0.Value.Y1, true);
+                }
+
+                model.SetAnimation(0, animName, false);
+
+                double prevW = PetRenderControl.SnapDip(view.HalfW * 2 * SimScale * (1 + PetRenderControl.PadX), 1);
+                double prevH = PetRenderControl.SnapDip(view.HalfH * 2 * SimScale * (1 + PetRenderControl.PadY) + inset, 1);
+                double curW = prevW, curH = prevH;
+                double minW = prevW, maxW = prevW;
+                double prevDrift = view.DriftX;
+                double driftVariance = 0, driftMaxStep = 0;
+                double minDrift = view.DriftX, maxDrift = view.DriftX;
+                int resizes = 0;
+
+                int steps = (int)((Math.Max(0.1f, anim.Duration) + 0.5) / SimDt);
+                for (int i = 0; i < steps; i++)
+                {
+                    model.Update((float)SimDt);
+                    now += SimDt;
+                    var fb = SkeletonModel.BoxOf(model.Skeleton);
+                    if (fb.HasValue) view.Update((float)now, model.BodyAxisX(), fb.Value.X0, fb.Value.Y0, fb.Value.X1, fb.Value.Y1, true);
+
+                    double w = PetRenderControl.SnapDip(view.HalfW * 2 * SimScale * (1 + PetRenderControl.PadX), 1);
+                    double h = PetRenderControl.SnapDip(view.HalfH * 2 * SimScale * (1 + PetRenderControl.PadY) + inset, 1);
+                    if (Math.Abs(w - curW) >= 2 || Math.Abs(h - curH) >= 2) { resizes++; curW = w; curH = h; }
+                    minW = Math.Min(minW, w); maxW = Math.Max(maxW, w);
+
+                    double d = view.DriftX * SimScale;
+                    double step = Math.Abs(d - prevDrift);
+                    driftVariance += step;
+                    driftMaxStep = Math.Max(driftMaxStep, step);
+                    minDrift = Math.Min(minDrift, d); maxDrift = Math.Max(maxDrift, d);
+                    prevDrift = d;
+                }
+
+                Console.WriteLine($"  | {animName} | {resizes} | {minW:0}→{maxW:0} | {driftVariance:0.0} | "
+                                  + $"{driftMaxStep:0.0} | {minDrift:0.0}..{maxDrift:0.0} |");
+            }
+        }
+    }
+
+    /// <summary>
     /// 播放时序模拟：idle → unique → idle → unique2 → idle → unique3 → idle。
     /// 验证「播放大位移动作时窗口不会暴涨」，以及动作之间来回切时 resize 次数。
     /// </summary>
@@ -118,7 +198,7 @@ public static class FitTool
             ("unique2", 3), ("idle", 2), ("unique3", 3), ("idle", 2),
         };
 
-        var view = new ViewFrame(model.Bounds, model.AnchorX, model.AnchorY, model.RawBounds, model.BodyBounds);
+        var view = new ViewFrame(model.Bounds, model.AnchorX, model.AnchorY, model.RawBounds, model.BodyBounds, model.BodyAxisCenter, model.DriftThreshold);
         double inset = Math.Max(12.0, (model.AnchorY - model.Bounds.MinY) * SimScale + 4.0);
 
         double prevW = -1, prevH = -1;
@@ -143,7 +223,7 @@ public static class FitTool
 
                 var fb = SkeletonModel.BoxOf(model.Skeleton);
                 if (fb.HasValue)
-                    view.Update((float)now, fb.Value.X0, fb.Value.Y0, fb.Value.X1, fb.Value.Y1, true);
+                    view.Update((float)now, model.BodyAxisX(), fb.Value.X0, fb.Value.Y0, fb.Value.X1, fb.Value.Y1, true);
 
                 double w = PetRenderControl.SnapDip(view.HalfW * 2.0 * SimScale * (1 + PetRenderControl.PadX), 1.0);
                 double h = PetRenderControl.SnapDip(view.HalfH * 2.0 * SimScale * (1 + PetRenderControl.PadY) + inset, 1.0);
@@ -190,9 +270,9 @@ public static class FitTool
 
             var fb = SkeletonModel.BoxOf(model.Skeleton);
             if (fb.HasValue)
-                view.Update((float)now, fb.Value.X0, fb.Value.Y0, fb.Value.X1, fb.Value.Y1, true);
+                view.Update((float)now, model.BodyAxisX(), fb.Value.X0, fb.Value.Y0, fb.Value.X1, fb.Value.Y1, true);
             else
-                view.Update((float)now, model.Bounds.MinX, model.Bounds.MinY, model.Bounds.MaxX, model.Bounds.MaxY, false);
+                view.Update((float)now, model.BodyAxisX(), model.Bounds.MinX, model.Bounds.MinY, model.Bounds.MaxX, model.Bounds.MaxY, false);
 
             // 与 PetWindow 同口径：DIP 量化到整数物理像素（scaling=1）
             double w = PetRenderControl.SnapDip(view.HalfW * 2.0 * SimScale * (1 + PetRenderControl.PadX), 1.0);

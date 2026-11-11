@@ -47,7 +47,7 @@ public sealed class SkeletonModel : IDisposable
     // ComputeBounds 的中间结果（构造函数在 anchor 算完后用它建表）
     private Dictionary<string, (float X0, float Y0, float X1, float Y1)>? _fitSetup;
     private Dictionary<string, (float X0, float Y0, float X1, float Y1)>? _fitRuntime;
-    private Dictionary<string, List<(float X0, float Y0, float X1, float Y1)>>? _fitFrames;
+    private Dictionary<string, List<(float X0, float Y0, float X1, float Y1, float BodyX)>>? _fitFrames;
     private (float X0, float Y0, float X1, float Y1) _fitBox;
 
     /// <summary>逐动画的拟合诊断（--fit 表格的数据源）。</summary>
@@ -55,6 +55,42 @@ public sealed class SkeletonModel : IDisposable
 
     /// <summary>静态框的覆盖率（有多少比例的帧完整落在静态框内）。</summary>
     public float BoundsCoverage { get; private set; }
+
+    /// <summary>
+    /// 待机时骨骼中位轴的稳态值（模型单位）。
+    /// 运行时 Drift 的参照点：drift = 该值 − 当前帧的骨骼中位轴。
+    /// </summary>
+    public float BodyAxisCenter { get; private set; }
+
+    /// <summary>Drift 阈值（模型单位）：未归一化绝对框宽的 8%。</summary>
+    public float DriftThreshold { get; private set; }
+
+    /// <summary>按 BodyX 算这一帧要补偿的平移量（与运行时同一公式）。</summary>
+    private float DriftFor(float bodyX)
+    {
+        float offset = BodyAxisCenter - bodyX;
+        return Math.Abs(offset) <= DriftThreshold ? 0f : offset - Math.Sign(offset) * DriftThreshold;
+    }
+
+    private static float Median(List<float> values)
+    {
+        if (values.Count == 0) return 0f;
+        values.Sort();
+        return values[values.Count / 2];
+    }
+
+    /// <summary>某只骨骼的横向身体轴（骨骼 worldX 中位数）。</summary>
+    private static float BodyAxisXOf(Skeleton skel)
+    {
+        int n = 0;
+        foreach (var b in skel.Bones) n++;
+        if (n == 0) return 0f;
+        var buf = new float[n];
+        int i = 0;
+        foreach (var b in skel.Bones) buf[i++] = b.WorldX;
+        Array.Sort(buf);
+        return buf[n / 2];
+    }
 
     /// <summary>
     /// 角色锚点的 X：身体中轴（Spine 本地坐标）。
@@ -167,10 +203,13 @@ public sealed class SkeletonModel : IDisposable
         const float dt = 1f / 30f;
         const float MixSeconds = 0.15f;
 
-        var frames = new List<(float X0, float Y0, float X1, float Y1)>();
-        var bodyFrames = new List<(float X0, float Y0, float X1, float Y1)>();
+        // 每帧同时记「顶点包围盒」和「骨骼中位轴 BodyX」：
+        //   包围盒决定要多大画布；BodyX 决定「骨架整体有没有被甩出去」。
+        //   两者必须成对采样，否则诊断算的补偿量和运行时的补偿量不是一回事。
+        var frames = new List<(float X0, float Y0, float X1, float Y1, float BodyX)>();
+        var bodyFrames = new List<(float X0, float Y0, float X1, float Y1, float BodyX)>();
         var runtimeBox = new Dictionary<string, (float X0, float Y0, float X1, float Y1)>(StringComparer.Ordinal);
-        var runtimeFrames = new Dictionary<string, List<(float X0, float Y0, float X1, float Y1)>>(StringComparer.Ordinal);
+        var runtimeFrames = new Dictionary<string, List<(float X0, float Y0, float X1, float Y1, float BodyX)>>(StringComparer.Ordinal);
 
         // 临时骨骼：与正式那只完全独立，算完就丢，绝不影响调用方状态
         var probe = new Skeleton(Data);
@@ -183,7 +222,7 @@ public sealed class SkeletonModel : IDisposable
         if (idleAnim != null && idleAnim.Duration > 0) idleDur = idleAnim.Duration;
         int idleSteps = Math.Max(1, (int)Math.Ceiling(idleDur / dt));
 
-        void Step(int count, List<(float X0, float Y0, float X1, float Y1)>? sink)
+        void Step(int count, List<(float X0, float Y0, float X1, float Y1, float BodyX)>? sink)
         {
             for (int i = 0; i < count; i++)
             {
@@ -191,7 +230,7 @@ public sealed class SkeletonModel : IDisposable
                 probeState.Apply(probe);
                 probe.UpdateWorldTransform(Skeleton.Physics.None);
                 var b = BoxOf(probe);
-                if (b.HasValue) sink?.Add(b.Value);
+                if (b.HasValue) sink?.Add((b.Value.X0, b.Value.Y0, b.Value.X1, b.Value.Y1, BodyAxisXOf(probe)));
             }
         }
 
@@ -201,7 +240,7 @@ public sealed class SkeletonModel : IDisposable
             probeState.ClearTracks();
             probe.SetToSetupPose();
             probeState.SetAnimation(0, idleName, true);
-            var idleFrames = new List<(float X0, float Y0, float X1, float Y1)>();
+            var idleFrames = new List<(float X0, float Y0, float X1, float Y1, float BodyX)>();
             Step(idleSteps, idleFrames);
             frames.AddRange(idleFrames);
             bodyFrames.AddRange(idleFrames);
@@ -223,7 +262,7 @@ public sealed class SkeletonModel : IDisposable
             float dur = anim.Duration <= 0 ? 0.1f : anim.Duration;
             int steps = (int)Math.Ceiling((dur + MixSeconds + 0.35f) / dt);
 
-            var local = new List<(float X0, float Y0, float X1, float Y1)>();
+            var local = new List<(float X0, float Y0, float X1, float Y1, float BodyX)>();
             Step(steps, local);
 
             frames.AddRange(local);
@@ -266,18 +305,20 @@ public sealed class SkeletonModel : IDisposable
         // ④ 位移归一化：把「整体被甩出去」的帧平移回本体中心，再统计静态框。
         //    阈值用「绝对框」的 8%：unique 偏 734 → 归一化；die 偏 162 → 低于阈值保留原样。
         float refW = Math.Max(1e-3f, absRaw.X1 - absRaw.X0);
-        float refH = Math.Max(1e-3f, absRaw.Y1 - absRaw.Y0);
         float thX = refW * ViewFrame.DriftThresholdRatio;
-        float thY = refH * ViewFrame.DriftThresholdRatio;
 
-        float bcx = (BodyBounds.MinX + BodyBounds.MaxX) * 0.5f;
-        float bcy = (BodyBounds.MinY + BodyBounds.MaxY) * 0.5f;
+        // 参照点 = 待机（本体）帧里骨骼中位轴的中位数。
+        // 这和运行时 ViewFrame 用的 BodyAxisCenter 是同一个量，诊断与运行才对得上。
+        var bodyXs = new List<float>(bodyFrames.Count);
+        foreach (var f in bodyFrames) bodyXs.Add(f.BodyX);
+        BodyAxisCenter = bodyXs.Count > 0 ? Median(bodyXs) : 0f;
+
+        DriftThreshold = thX;
 
         var norm = new List<(float X0, float Y0, float X1, float Y1)>(frames.Count);
         foreach (var f in frames)
         {
-            float cx = (f.X0 + f.X1) * 0.5f;
-            float dx = Math.Abs(cx - bcx) > thX ? bcx - cx : 0f;
+            float dx = DriftFor(f.BodyX);
             // 只归一化 X：纵向偏移多是动作本身（die 躺下 / unique2 上浮），
             // 归一化会把静态框的高度裁掉一块；纵向交给视框扩张。
             norm.Add((f.X0 + dx, f.Y0, f.X1 + dx, f.Y1));
@@ -336,11 +377,8 @@ public sealed class SkeletonModel : IDisposable
         float statHalfW = Math.Max(1e-3f, Math.Max(AnchorX - box.X0, box.X1 - AnchorX));
         float statHalfH = Math.Max(1e-3f, Math.Max(AnchorY - box.Y0, box.Y1 - AnchorY));
 
-        // 与 ViewFrame / 位移归一化完全同一口径：中心取「本体框中心」，阈值取「未归一化绝对框」的 8%
-        float bcx = (BodyBounds.MinX + BodyBounds.MaxX) * 0.5f;
-        float bcy = (BodyBounds.MinY + BodyBounds.MaxY) * 0.5f;
-        float thX = Math.Max(1e-3f, RawBounds.MaxX - RawBounds.MinX) * ViewFrame.DriftThresholdRatio;
-        float thY = Math.Max(1e-3f, RawBounds.MaxY - RawBounds.MinY) * ViewFrame.DriftThresholdRatio;
+        // 与运行时 ViewFrame 完全同一口径：参照 = 待机骨骼中位轴，阈值 = 绝对框宽的 8%
+        float thX = DriftThreshold;
 
         foreach (var anim in Data.Animations)
         {
@@ -360,9 +398,7 @@ public sealed class SkeletonModel : IDisposable
             {
                 foreach (var f in list)
                 {
-                    float cx = (f.X0 + f.X1) * 0.5f;
-                    float dx = Math.Abs(cx - bcx) > thX ? bcx - cx : 0f;   // 与 ViewFrame 一致：只补 X
-                    float dy = 0f;
+                    float dx = DriftFor(f.BodyX);   // 与运行时一致：按骨骼中位轴补 X
 
                     float px0 = f.X0 + dx, px1 = f.X1 + dx;
                     float py0 = f.Y0, py1 = f.Y1;
@@ -374,9 +410,8 @@ public sealed class SkeletonModel : IDisposable
                                           Math.Max(box.Y0 - py0, py1 - box.Y1));
                     if (over > fit.ClipUnits) fit.ClipUnits = over;
 
-                    if (Math.Abs(dx) > 15f || Math.Abs(dy) > 15f) fit.DriftedFrames++;
+                    if (Math.Abs(dx) > 15f) fit.DriftedFrames++;
                     if (Math.Abs(dx) > fit.MaxDriftX) fit.MaxDriftX = Math.Abs(dx);
-                    if (Math.Abs(dy) > fit.MaxDriftY) fit.MaxDriftY = Math.Abs(dy);
                 }
                 fit.FrameCount = list.Count;
             }
@@ -399,6 +434,31 @@ public sealed class SkeletonModel : IDisposable
     /// <summary>「常驻状态」动画：它们是角色的本体，用来算本体框和 Drift 参照。</summary>
     private static bool IsBodyAnimation(string name) =>
         name is "idle" or "channel_idle" or "posture" or "sleep" or "giga_idle";
+
+    private float[] _boneBuf = new float[256];
+
+    /// <summary>
+    /// 骨架的横向「身体轴」：所有骨骼 worldX 的中位数。
+    ///
+    /// 为什么不直接用顶点包围盒中心：
+    ///   包围盒会被「抬手举剑 / 披风张开 / 脚下特效」拉偏。313703 的 channel_idle
+    ///   里包围盒中心在 -152..-24 之间摆（跨度 132 单位），而骨骼中位数只在 -7..0 之间动
+    ///   （跨度 17）。拿包围盒中心当位移参照，补偿量就会跟着四肢一起抖 —— 这正是
+    ///   播放时「角色在窗口里来回蹭」的来源。骨骼中位数只反映骨架整体的平移，稳得多。
+    /// </summary>
+    public float BodyAxisX()
+    {
+        int n = 0;
+        foreach (var b in Skeleton.Bones) n++;
+        if (n == 0) return 0f;
+
+        if (_boneBuf.Length < n) _boneBuf = new float[n];
+        int i = 0;
+        foreach (var b in Skeleton.Bones) _boneBuf[i++] = b.WorldX;
+
+        Array.Sort(_boneBuf, 0, n);
+        return _boneBuf[n / 2];
+    }
 
     /// <summary>取一只骨骼当前所有可见附件的顶点包围盒。</summary>
     internal static (float X0, float Y0, float X1, float Y1)? BoxOf(Skeleton skel)
@@ -435,6 +495,21 @@ public sealed class SkeletonModel : IDisposable
 
     private static (float X0, float Y0, float X1, float Y1) Union(
         List<(float X0, float Y0, float X1, float Y1)> list)
+    {
+        float x0 = float.MaxValue, y0 = float.MaxValue;
+        float x1 = float.MinValue, y1 = float.MinValue;
+        foreach (var f in list)
+        {
+            if (f.X0 < x0) x0 = f.X0;
+            if (f.Y0 < y0) y0 = f.Y0;
+            if (f.X1 > x1) x1 = f.X1;
+            if (f.Y1 > y1) y1 = f.Y1;
+        }
+        return x0 <= x1 ? (x0, y0, x1, y1) : (0f, 0f, 0f, 0f);
+    }
+
+    private static (float X0, float Y0, float X1, float Y1) Union(
+        List<(float X0, float Y0, float X1, float Y1, float BodyX)> list)
     {
         float x0 = float.MaxValue, y0 = float.MaxValue;
         float x1 = float.MinValue, y1 = float.MinValue;

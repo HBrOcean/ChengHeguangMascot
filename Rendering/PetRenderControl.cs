@@ -73,7 +73,8 @@ public sealed class PetRenderControl : Control, IDisposable
     public PetRenderControl(SkeletonModel model)
     {
         _model = model;
-        _view = new ViewFrame(model.Bounds, model.AnchorX, model.AnchorY, model.RawBounds, model.BodyBounds);
+        _view = new ViewFrame(model.Bounds, model.AnchorX, model.AnchorY, model.RawBounds, model.BodyBounds,
+                              model.BodyAxisCenter, model.DriftThreshold);
         // 30fps：桌面挂件足够顺，且比 60fps 省一半 CPU
         _timer = new DispatcherTimer(TimeSpan.FromMilliseconds(33), DispatcherPriority.Render, OnFrame);
         _timer.Start();
@@ -241,12 +242,12 @@ public sealed class PetRenderControl : Control, IDisposable
         if (!TryGetFrameBounds(out var fb))
         {
             // 还没有可用顶点（首帧/资源异常）：保持静态框
-            _view.Update(now, _model.Bounds.MinX, _model.Bounds.MinY,
+            _view.Update(now, _model.BodyAxisX(), _model.Bounds.MinX, _model.Bounds.MinY,
                               _model.Bounds.MaxX, _model.Bounds.MaxY, false);
             return;
         }
 
-        _view.Update(now, fb.MinX, fb.MinY, fb.MaxX, fb.MaxY, DynamicView);
+        _view.Update(now, _model.BodyAxisX(), fb.MinX, fb.MinY, fb.MaxX, fb.MaxY, DynamicView);
     }
 
     /// <summary>把视框立刻复位到静态包围盒（关闭动态尺寸、换皮肤时用）。</summary>

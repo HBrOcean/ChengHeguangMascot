@@ -26,6 +26,13 @@ internal static class Program
             return;
         }
 
+        // 抖动体检：--shake 逐动作量化窗口改动次数与位移补偿的抖动
+        if (args.Length > 0 && args[0] == "--shake")
+        {
+            FitTool.RunShake(allSkins: args.Contains("--all", StringComparer.OrdinalIgnoreCase));
+            return;
+        }
+
         // 体检：--fit 纯计算，输出「动作是否出窗 / 待机窗口会不会动」的表格
         if (args.Length > 0 && args[0] == "--fit")
         {

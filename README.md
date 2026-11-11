@@ -84,6 +84,7 @@
 ```bash
 ChengHeguangMascot --fit        # 默认皮肤：逐动作体检 + 待机 60 秒窗口稳定性
 ChengHeguangMascot --fit --all  # 三套皮肤都做 60 秒模拟
+ChengHeguangMascot --shake      # 逐动作量化抖动：窗口改动次数 / 位移补偿抖动
 ChengHeguangMascot --dump       # 渲染一帧 PNG 到系统临时目录，排查贴图/旋转问题
 ```
 
@@ -99,6 +100,9 @@ ChengHeguangMascot --dump       # 渲染一帧 PNG 到系统临时目录，排�
 | 裁切像素 | 减去位移补偿后仍然超出静态框的最大距离 |
 
 判据：`unique` 的峰值倍率 ≤ 1.15 且裁切 = 0；待机 60 秒 resize 次数 = 0、窗口尺寸极差 = 0。
+
+`--shake` 输出每个动作的「窗口 resize 次数」和「Drift 总变差 / 单帧最大变化」。
+正常动作应该全是 0；只有 `unique` 这类真的把骨架甩出去的动作会有 Drift 变化（那是动作本身）。
 
 > 为什么判据用「补偿后需求」而不是「跨帧 union 宽」：`unique` 会把骨架整体甩到 x≈-1798，
 > 跨帧 union 宽 1947，但任何**单帧**都不超过 500 宽。窗口装不装得下取决于单帧，
