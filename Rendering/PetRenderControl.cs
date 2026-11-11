@@ -30,16 +30,9 @@ public sealed class PetRenderControl : Control, IDisposable
     private double _cachedScaling = 1.0;
     private bool _disposed;
 
-    // 视框：以「静态包围盒中心」为中心的半宽/半高，可随动作幅度扩张。
-    //
-    // 为什么只存半宽半高、中心固定：
-    //   若像原来那样存 minX/minY/maxX/maxY 四边，四边各自独立插值，
-    //   视框中心就会漂移，绘制时角色跟着左右上下跑（"偏移"）。
-    //   锁定中心后，视框永远对称扩张，角色始终在窗口正中间。
-    private float _halfW, _halfH;
-
-    /// <summary>上一次视框扩张的时刻。收缩前要等一小会儿，避免连续动作之间窗口来回缩涨。</summary>
-    private float _lastGrowTime;
+    // 视框状态机：扩张 / 延迟收缩 / 位移补偿都在 ViewFrame 里。
+    // 抽出去是为了让 --fit 诊断跑同一套逻辑（纯计算，不需要窗口）。
+    private readonly ViewFrame _view;
 
     // 算当前帧包围盒用的临时缓冲（够长就不重新分配）
     private float[] _boundsBuf = new float[256];
@@ -80,9 +73,7 @@ public sealed class PetRenderControl : Control, IDisposable
     public PetRenderControl(SkeletonModel model)
     {
         _model = model;
-        // 初始视框与 ResetView 用同一套口径（锚点到最远边），
-        // 否则第一帧的窗口尺寸会和实际绘制的锚点对不上。
-        ResetView();
+        _view = new ViewFrame(model.Bounds, model.AnchorX, model.AnchorY, model.RawBounds, model.BodyBounds);
         // 30fps：桌面挂件足够顺，且比 60fps 省一半 CPU
         _timer = new DispatcherTimer(TimeSpan.FromMilliseconds(33), DispatcherPriority.Render, OnFrame);
         _timer.Start();
@@ -102,23 +93,50 @@ public sealed class PetRenderControl : Control, IDisposable
     }
 
     /// <summary>
-    /// 控件期望的 DIP 尺寸 = 视框 × 缩放 × (1 + 边距)。
-    /// 这里的边距和 RenderFrame 里的绘制框用的是同一组常量，两边必须保持同步，
-    /// 否则会算出一边贴边、另一边有余量的结果。
+    /// 脚底到窗口下沿的距离（DIP）。
+    ///
+    /// 动态量：至少要装下 AnchorY 以下的那部分轮廓（Bounds.MinY..AnchorY），再留 4 DIP 缝隙。
+    /// 之所以不是固定 12：有的皮肤脚底下面还有一小段影子/衣摆，固定 12 会把它们裁掉。
     /// </summary>
-    public Size DesiredPetSize
+    public double GroundInsetDips
     {
         get
         {
-            double w = _halfW * 2.0 * Scale;
-            double h = _halfH * 2.0 * Scale;
-
-            // 高度额外加上脚底的 GroundInset：角色从底边往上长，
-            // 那段留给“脚底离窗口下沿”的空白必须在窗口里，否则头顶会被裁。
-            return new Size(Math.Max(1, w * (1 + PadX)),
-                            Math.Max(1, h * (1 + PadY) + GroundInset));
+            var b = _model.Bounds;
+            double belowAnchor = (_model.AnchorY - b.MinY) * Scale;
+            return Math.Max(GroundInset, belowAnchor + 4.0);
         }
     }
+
+    /// <summary>
+    /// 把 DIP 尺寸量化到整数物理像素。
+    /// 窗口和 canvas 必须用同一个量化结果，否则两边差 1px，连续 resize 时会看到 1px 抖动。
+    /// </summary>
+    public static double SnapDip(double dip, double scaling)
+    {
+        if (scaling <= 0 || double.IsNaN(dip) || double.IsInfinity(dip)) return dip;
+        return Math.Round(dip * scaling, MidpointRounding.AwayFromZero) / scaling;
+    }
+
+    /// <summary>
+    /// 期望尺寸 = 视框 × 缩放 × (1 + 边距) + 脚底内缩。
+    /// 这里的边距与 RenderFrame 用的是同一组常量，两边必须同步，
+    /// 否则会一边贴边、一边有余量。
+    /// </summary>
+    public Size GetDesiredSize(double scaling)
+    {
+        double w = _view.HalfW * 2.0 * Scale * (1 + PadX);
+        double h = _view.HalfH * 2.0 * Scale * (1 + PadY) + GroundInsetDips;
+        return new Size(SnapDip(Math.Max(1.0, w), scaling),
+                        SnapDip(Math.Max(1.0, h), scaling));
+    }
+
+    /// <summary>按当前渲染缩放算尺寸（没拿到 TopLevel 时按 1.0 算）。</summary>
+    public Size DesiredPetSize => GetDesiredSize(_cachedScaling > 0 ? _cachedScaling : 1.0);
+
+    /// <summary>当前视框半宽/半高（诊断用）。</summary>
+    public float ViewHalfW => _view.HalfW;
+    public float ViewHalfH => _view.HalfH;
 
     private void RenderFrame()
     {
@@ -126,10 +144,10 @@ public sealed class PetRenderControl : Control, IDisposable
         var top = TopLevel.GetTopLevel(this);
         if (top != null) _cachedScaling = top.RenderScaling > 0 ? top.RenderScaling : 1.0;
 
-        // 与 PetWindow 里 newPxW/newPxH 的算法保持一致（都是 Ceiling），
+        // 与 PetWindow 里 newPxW/newPxH 的算法保持一致（都是 Round），
         // 否则两处差 1px，连续 resize 时会看到 1px 级的抖动。
-        int pw = Math.Max(1, (int)Math.Ceiling(Bounds.Width * _cachedScaling));
-        int ph = Math.Max(1, (int)Math.Ceiling(Bounds.Height * _cachedScaling));
+        int pw = Math.Max(1, (int)Math.Round(Bounds.Width * _cachedScaling, MidpointRounding.AwayFromZero));
+        int ph = Math.Max(1, (int)Math.Round(Bounds.Height * _cachedScaling, MidpointRounding.AwayFromZero));
         if (pw < 2 || ph < 2) return; // 尚未完成布局
 
         if (_surface == null || _surfaceW != pw || _surfaceH != ph)
@@ -164,8 +182,8 @@ public sealed class PetRenderControl : Control, IDisposable
             ? (float)Math.Sin(_clock.Elapsed.TotalSeconds * 1.8) * 5f * (float)_cachedScaling
             : 0f;
 
-        // 脚底线钉在窗口下沿上方 GroundInset 处；水平钉在窗口正中
-        float groundPx = ph - (float)(GroundInset * _cachedScaling) + bobPx;
+        // 脚底线钉在窗口下沿上方 GroundInsetDips 处；水平钉在窗口正中
+        float groundPx = ph - (float)(GroundInsetDips * _cachedScaling) + bobPx;
         canvas.Translate(pw * 0.5f, groundPx);
 
         // 绘制比例只由「用户缩放 × 屏幕 DPI」决定，与窗口尺寸彻底解耦。
@@ -177,7 +195,10 @@ public sealed class PetRenderControl : Control, IDisposable
 
         // 水平翻转：X 方向取负
         canvas.Scale(Flip ? -s : s, -s);
-        canvas.Translate(-ax, -ay);
+
+        // 位移补偿：把「整体被甩出去」的帧拉回窗口中心。
+        // 不加这一项，unique 会把角色画到窗口左边界外（实测偏 734 单位）。
+        canvas.Translate(-(ax + _view.DriftX), -(ay + _view.DriftY));
         _renderer.Draw(canvas, _model.Skeleton, _model);
         canvas.Restore();
         canvas.Flush();
@@ -207,74 +228,29 @@ public sealed class PetRenderControl : Control, IDisposable
     }
 
     /// <summary>
-    /// 更新视框：只算半宽/半高，中心固定为静态包围盒中心。
+    /// 更新视框：把当前帧的顶点包围盒交给 ViewFrame，由它处理
+    /// 「位移补偿 → 需求 → 运行时累积天花板 → 扩张立即/收缩延迟」。
     ///
-    /// 只用「模型顶点」计算，绝不参考窗口尺寸 —— 否则会形成
+    /// 只用模型顶点，绝不参考窗口尺寸 —— 否则会形成
     /// 「窗口变大 → 比例变大 → 视框变大 → 窗口更大」的反馈环。
-    ///
-    /// 扩张立即生效、收缩才平滑：动作起手那几帧必须马上让开，
-    /// 否则窗口来不及变大，角色当场被裁。
     /// </summary>
     private void UpdateView()
     {
-        var sb = _model.Bounds;
-        float ax = _model.AnchorX;
-        float ay = _model.AnchorY;
+        float now = (float)_clock.Elapsed.TotalSeconds;
 
-        // 半宽/半高相对「锚点」算 —— 渲染时锚点被钉在窗口底部中心，
-        // 所以「锚点到最远边」的距离才是窗口真正需要留的空间。
-        float statHalfW = Math.Max(1e-3f, Math.Max(ax - sb.MinX, sb.MaxX - ax));
-        float statHalfH = Math.Max(1e-3f, Math.Max(ay - sb.MinY, sb.MaxY - ay));
-
-        float targetW = statHalfW;
-        float targetH = statHalfH;
-
-        if (DynamicView && TryGetFrameBounds(out var fb))
+        if (!TryGetFrameBounds(out var fb))
         {
-            // 当前帧相对中心需要多大的半宽/半高。
-            // 取两侧的较大值 —— 对称扩张才不会让角色偏离窗口中心。
-            float needW = Math.Max(ax - fb.MinX, fb.MaxX - ax);
-            float needH = Math.Max(ay - fb.MinY, fb.MaxY - ay);
-
-            if (needW > targetW) targetW = needW;
-            if (needH > targetH) targetH = needH;
-
-            // 限制最大扩张倍率：个别动画会让骨架整体位移到很远，
-            // 不设上限的话窗口会瞬间撑到半个屏幕。
-            //
-            // 3.0 是按程和光三套素材实测定的：die 是「整只向左躺下」，峰值需要
-            // 静态半宽的 2.74~2.85 倍；skill1 / unique3 需要 2.0~2.2 倍。
-            // 窗口背景透明，扩张时用户看不到边框，所以放宽上限不会有视觉突兀，
-            // 只是这几帧的 surface 面积变大一点。
-            const float MaxExpand = 3.0f;
-            targetW = Math.Min(targetW, statHalfW * MaxExpand);
-            targetH = Math.Min(targetH, statHalfH * MaxExpand);
+            // 还没有可用顶点（首帧/资源异常）：保持静态框
+            _view.Update(now, _model.Bounds.MinX, _model.Bounds.MinY,
+                              _model.Bounds.MaxX, _model.Bounds.MaxY, false);
+            return;
         }
 
-        // 不能比静态框更小，否则角色会被整体缩小
-        if (targetW < statHalfW) targetW = statHalfW;
-        if (targetH < statHalfH) targetH = statHalfH;
-
-        // 扩张立即生效；收缩前留 1 秒宽限 ——
-        // 动作之间常常只隔零点几秒，立刻收缩会导致窗口反复缩涨，看着像抽搐。
-        float now = (float)_clock.Elapsed.TotalSeconds;
-        const float ShrinkDelay = 1.0f;
-        const float ShrinkK = 0.12f;   // 开始收之后约 0.6 秒到位
-
-        if (targetW > _halfW) { _halfW = targetW; _lastGrowTime = now; }
-        else if (now - _lastGrowTime > ShrinkDelay) _halfW += (targetW - _halfW) * ShrinkK;
-
-        if (targetH > _halfH) { _halfH = targetH; _lastGrowTime = now; }
-        else if (now - _lastGrowTime > ShrinkDelay) _halfH += (targetH - _halfH) * ShrinkK;
+        _view.Update(now, fb.MinX, fb.MinY, fb.MaxX, fb.MaxY, DynamicView);
     }
 
-    /// <summary>把视框立刻复位到静态包围盒（关闭动态尺寸时用）。</summary>
-    public void ResetView()
-    {
-        var b = _model.Bounds;
-        _halfW = Math.Max(1e-3f, Math.Max(_model.AnchorX - b.MinX, b.MaxX - _model.AnchorX));
-        _halfH = Math.Max(1e-3f, Math.Max(_model.AnchorY - b.MinY, b.MaxY - _model.AnchorY));
-    }
+    /// <summary>把视框立刻复位到静态包围盒（关闭动态尺寸、换皮肤时用）。</summary>
+    public void ResetView() => _view.Reset();
 
     /// <summary>
     /// 取当前帧实际顶点包围盒（Spine 本地坐标）。

@@ -31,6 +31,32 @@ public sealed class SkeletonModel : IDisposable
     public (float MinX, float MinY, float MaxX, float MaxY) Bounds { get; }
 
     /// <summary>
+    /// 「本体」包围盒：只用 idle / channel_idle / posture / sleep 这类常驻动画的帧算出来的框。
+    /// 它是 Drift 的参照中心，也是判断「一帧是不是被整体甩出去了」的基线。
+    /// </summary>
+    public (float MinX, float MinY, float MaxX, float MaxY) BodyBounds { get; private set; }
+
+    /// <summary>
+    /// 未做位移归一化的绝对框（所有帧的原始并集）。
+    /// 它只用来当 Drift 阈值的基准（阈值 = 8% 这个宽度），不参与窗口尺寸。
+    /// </summary>
+    public (float MinX, float MinY, float MaxX, float MaxY) RawBounds { get; private set; }
+
+    private readonly List<AnimFit> _fit = new();
+
+    // ComputeBounds 的中间结果（构造函数在 anchor 算完后用它建表）
+    private Dictionary<string, (float X0, float Y0, float X1, float Y1)>? _fitSetup;
+    private Dictionary<string, (float X0, float Y0, float X1, float Y1)>? _fitRuntime;
+    private Dictionary<string, List<(float X0, float Y0, float X1, float Y1)>>? _fitFrames;
+    private (float X0, float Y0, float X1, float Y1) _fitBox;
+
+    /// <summary>逐动画的拟合诊断（--fit 表格的数据源）。</summary>
+    public IReadOnlyList<AnimFit> FitReport => _fit;
+
+    /// <summary>静态框的覆盖率（有多少比例的帧完整落在静态框内）。</summary>
+    public float BoundsCoverage { get; private set; }
+
+    /// <summary>
     /// 角色锚点的 X：身体中轴（Spine 本地坐标）。
     /// 取自「头部带」顶点的 x 中位数 —— 中位数天然忽略伸出去的武器/披风。
     /// </summary>
@@ -64,6 +90,9 @@ public sealed class SkeletonModel : IDisposable
         var anchor = ComputeAnchor();
         AnchorX = anchor.X;
         AnchorY = anchor.Y;
+
+        // 诊断表要用真实的 anchor（脚底/中轴）算「峰值倍率」，所以放在 anchor 之后。
+        BuildFitReport();
     }
 
     /// <summary>取某个区域对应的贴图（RegionAttachment / MeshAttachment 共用）。</summary>
@@ -127,92 +156,296 @@ public sealed class SkeletonModel : IDisposable
 
     private (float, float, float, float) ComputeBounds()
     {
-        // 逐帧采样，每帧记一个包围盒，最后做统计而不是简单取全局 min/max。
+        // ────────────────────────────────────────────────────────────────
+        // 采样方式：模拟「真实播放」，而不是把每个动画单独摆到 setup pose 上量。
         //
-        // 为什么：部分 Spine 模型里 born / posture 这类动画会把骨架整体位移到很远
-        // （实测有模型跑到 x≈-999）。直接对所有帧取绝对 min/max，包围盒会被撑成
-        // 1200+ 宽，渲染时按框缩放，桌宠就变成一小只还偏在一边。
+        // 为什么必须换：313701 的 unique 没有把所有骨骼关键帧化。单独按
+        // MixBlend.Setup 播，得到 x∈[-283,102]（宽 385）；而运行时是从 idle
+        // 用 0.15 的 mix 进入，得到的是 x∈[-1798,149]（宽 1947，中心偏 -734）。
+        // 旧算法只认 385，于是 unique 有 35% 的帧被裁掉，而窗口一点不涨。
+        // ────────────────────────────────────────────────────────────────
+        const float dt = 1f / 30f;
+        const float MixSeconds = 0.15f;
+
         var frames = new List<(float X0, float Y0, float X1, float Y1)>();
+        var bodyFrames = new List<(float X0, float Y0, float X1, float Y1)>();
+        var runtimeBox = new Dictionary<string, (float X0, float Y0, float X1, float Y1)>(StringComparer.Ordinal);
+        var runtimeFrames = new Dictionary<string, List<(float X0, float Y0, float X1, float Y1)>>(StringComparer.Ordinal);
 
-        void SampleFrame()
+        // 临时骨骼：与正式那只完全独立，算完就丢，绝不影响调用方状态
+        var probe = new Skeleton(Data);
+        var probeState = new AnimationState(new AnimationStateData(Data) { DefaultMix = MixSeconds });
+
+        string idleName = PickBodyAnimationName();
+
+        float idleDur = 0.1f;
+        var idleAnim = idleName.Length > 0 ? Data.FindAnimation(idleName) : null;
+        if (idleAnim != null && idleAnim.Duration > 0) idleDur = idleAnim.Duration;
+        int idleSteps = Math.Max(1, (int)Math.Ceiling(idleDur / dt));
+
+        void Step(int count, List<(float X0, float Y0, float X1, float Y1)>? sink)
         {
-            Skeleton.UpdateWorldTransform(Skeleton.Physics.None);
-
-            float fx0 = float.MaxValue, fy0 = float.MaxValue;
-            float fx1 = float.MinValue, fy1 = float.MinValue;
-
-            foreach (var slot in Skeleton.DrawOrder)
+            for (int i = 0; i < count; i++)
             {
-                if (slot.Attachment is not VertexAttachment va || va.WorldVerticesLength < 2) continue;
-
-                var verts = new float[va.WorldVerticesLength];
-                va.ComputeWorldVertices(slot, verts);
-                for (int i = 0; i + 1 < verts.Length; i += 2)
-                {
-                    if (verts[i] < fx0) fx0 = verts[i];
-                    if (verts[i] > fx1) fx1 = verts[i];
-                    if (verts[i + 1] < fy0) fy0 = verts[i + 1];
-                    if (verts[i + 1] > fy1) fy1 = verts[i + 1];
-                }
+                probeState.Update(dt);
+                probeState.Apply(probe);
+                probe.UpdateWorldTransform(Skeleton.Physics.None);
+                var b = BoxOf(probe);
+                if (b.HasValue) sink?.Add(b.Value);
             }
-
-            if (fx0 <= fx1 && fy0 <= fy1) frames.Add((fx0, fy0, fx1, fy1));
         }
 
-        // 遍历「所有」动画采样。
-        //
-        // 每动画 49 帧（原来只有 13 帧）：采样太稀会让快速摆动的极值落在两个采样点
-        // 之间，静态包围盒就会偏小，运行时表现为"渲染超出窗口"。
+        // ① 待机一个完整循环 —— 待机本身就是常驻显示内容，必须进统计
+        if (idleName.Length > 0)
+        {
+            probeState.ClearTracks();
+            probe.SetToSetupPose();
+            probeState.SetAnimation(0, idleName, true);
+            var idleFrames = new List<(float X0, float Y0, float X1, float Y1)>();
+            Step(idleSteps, idleFrames);
+            frames.AddRange(idleFrames);
+            bodyFrames.AddRange(idleFrames);
+        }
+
+        // ② 每个动作：先跑一个 idle 循环把骨架摆到「真实待机姿势」，
+        //    再用默认 mix 混合进入动作，按 1/30 步进到动作结束（+ mix 期）
+        foreach (var anim in Data.Animations)
+        {
+            probeState.ClearTracks();
+            probe.SetToSetupPose();
+            if (idleName.Length > 0)
+            {
+                probeState.SetAnimation(0, idleName, true);
+                Step(idleSteps, null);      // 只为建立姿势，不重复计入统计
+            }
+
+            probeState.SetAnimation(0, anim.Name, false);
+            float dur = anim.Duration <= 0 ? 0.1f : anim.Duration;
+            int steps = (int)Math.Ceiling((dur + MixSeconds + 0.35f) / dt);
+
+            var local = new List<(float X0, float Y0, float X1, float Y1)>();
+            Step(steps, local);
+
+            frames.AddRange(local);
+            runtimeFrames[anim.Name] = local;
+            runtimeBox[anim.Name] = Union(local);
+            if (IsBodyAnimation(anim.Name)) bodyFrames.AddRange(local);
+        }
+
+        // ③ 旧算法（MixBlend.Setup 单放）—— 只为 --fit 表格里的「setup 采样宽」留一份对照
+        var setupBox = new Dictionary<string, (float X0, float Y0, float X1, float Y1)>(StringComparer.Ordinal);
         foreach (var anim in Data.Animations)
         {
             float dur = anim.Duration <= 0 ? 0.1f : anim.Duration;
-            const int steps = 48;
-            for (int i = 0; i <= steps; i++)
+            var u = (X0: float.MaxValue, Y0: float.MaxValue, X1: float.MinValue, Y1: float.MinValue);
+            for (int i = 0; i <= 48; i++)
             {
-                anim.Apply(Skeleton, 0f, dur * i / steps, false, null, 1f, MixBlend.Setup, MixDirection.In);
-                SampleFrame();
+                probe.SetToSetupPose();
+                anim.Apply(probe, 0f, dur * i / 48f, false, null, 1f, MixBlend.Setup, MixDirection.In);
+                probe.UpdateWorldTransform(Skeleton.Physics.None);
+                var b = BoxOf(probe);
+                if (!b.HasValue) continue;
+                u.X0 = Math.Min(u.X0, b.Value.X0); u.Y0 = Math.Min(u.Y0, b.Value.Y0);
+                u.X1 = Math.Max(u.X1, b.Value.X1); u.Y1 = Math.Max(u.Y1, b.Value.Y1);
             }
+            setupBox[anim.Name] = u.X0 <= u.X1 ? u : (0f, 0f, 0f, 0f);
         }
 
-        // 恢复干净状态交给调用方
+        // 临时骨骼用完复位；正式骨骼也恢复干净状态交给调用方
+        probe.SetToSetupPose();
         Skeleton.SetToSetupPose();
         State.Apply(Skeleton);
         Skeleton.UpdateWorldTransform(Skeleton.Physics.None);
 
-        // 一个动画都没有 → 用 setup pose 自己当包围盒
-        if (frames.Count == 0) SampleFrame();
         if (frames.Count == 0) return (-100, -100, 100, 100);
 
-        // 绝对框
-        float x0 = float.MaxValue, y0 = float.MaxValue, x1 = float.MinValue, y1 = float.MinValue;
+        var absRaw = Union(frames);
+        RawBounds = absRaw;
+        BodyBounds = bodyFrames.Count > 0 ? Union(bodyFrames) : absRaw;
+
+        // ④ 位移归一化：把「整体被甩出去」的帧平移回本体中心，再统计静态框。
+        //    阈值用「绝对框」的 8%：unique 偏 734 → 归一化；die 偏 162 → 低于阈值保留原样。
+        float refW = Math.Max(1e-3f, absRaw.X1 - absRaw.X0);
+        float refH = Math.Max(1e-3f, absRaw.Y1 - absRaw.Y0);
+        float thX = refW * ViewFrame.DriftThresholdRatio;
+        float thY = refH * ViewFrame.DriftThresholdRatio;
+
+        float bcx = (BodyBounds.MinX + BodyBounds.MaxX) * 0.5f;
+        float bcy = (BodyBounds.MinY + BodyBounds.MaxY) * 0.5f;
+
+        var norm = new List<(float X0, float Y0, float X1, float Y1)>(frames.Count);
         foreach (var f in frames)
+        {
+            float cx = (f.X0 + f.X1) * 0.5f;
+            float dx = Math.Abs(cx - bcx) > thX ? bcx - cx : 0f;
+            // 只归一化 X：纵向偏移多是动作本身（die 躺下 / unique2 上浮），
+            // 归一化会把静态框的高度裁掉一块；纵向交给视框扩张。
+            norm.Add((f.X0 + dx, f.Y0, f.X1 + dx, f.Y1));
+        }
+
+        var absNorm = Union(norm);
+        var q = QuantileBox(norm);
+
+        // ⑤ 选静态框：分位框能否覆盖 ≥95% 的帧？
+        //    「每个帧的整个包围盒都落在分位框内」才算覆盖 —— 只要有一大批帧被裁，
+        //    说明 10%/90% 的裁剪砍掉的是真实内容，而不是零星特效，这时必须用绝对框。
+        int inside = 0;
+        foreach (var f in norm)
+        {
+            if (f.X0 >= q.X0 - 1e-3f && f.X1 <= q.X1 + 1e-3f &&
+                f.Y0 >= q.Y0 - 1e-3f && f.Y1 <= q.Y1 + 1e-3f) inside++;
+        }
+        BoundsCoverage = (float)inside / norm.Count;
+
+        var box = BoundsCoverage >= 0.95f ? q : absNorm;
+
+        // 1.5% 呼吸余量：抗浮点误差，也让「刚好贴合」的动画（unique3 正好 1.00×）不至于因为
+        // 四舍五入掉一个像素就被判成裁切。这点量在窗口上约 1~2 DIP，看不出来。
+        box = Expand(box, 0.015f);
+
+        Logger.Log($"[Bounds] 真实播放采样 {frames.Count} 帧：绝对框 "
+                 + $"{absNorm.X1 - absNorm.X0:0}×{absNorm.Y1 - absNorm.Y0:0}"
+                 + $"，分位框 {q.X1 - q.X0:0}×{q.Y1 - q.Y0:0}"
+                 + $"，覆盖率 {BoundsCoverage:P1} → 静态框取{(BoundsCoverage >= 0.95f ? "分位框" : "绝对框")}"
+                 + $"（{box.X1 - box.X0:0}×{box.Y1 - box.Y0:0}）");
+
+        // 中间结果留给构造函数（那时 anchor 才算出来）
+        _fitSetup = setupBox;
+        _fitRuntime = runtimeBox;
+        _fitFrames = runtimeFrames;
+        _fitBox = (box.X0, box.Y0, box.X1, box.Y1);
+
+        return box;
+    }
+
+    /// <summary>
+    /// 逐动画体检表：把「旧算法量到的宽度」和「真实播放时实际需要的宽度」摆在一起。
+    /// 峰值倍率 = 该动画实际需要的半宽 / 静态框半宽（>1 就说明静态框装不下）。
+    /// 裁切 = 减去 Drift 之后仍然超出静态框的最大距离（模型单位）。
+    /// </summary>
+    private void BuildFitReport()
+    {
+        if (_fitSetup == null || _fitRuntime == null || _fitFrames == null) return;
+        var setupBox = _fitSetup;
+        var runtimeBox = _fitRuntime;
+        var runtimeFrames = _fitFrames;
+        var box = _fitBox;
+
+        _fit.Clear();
+
+        float statHalfW = Math.Max(1e-3f, Math.Max(AnchorX - box.X0, box.X1 - AnchorX));
+        float statHalfH = Math.Max(1e-3f, Math.Max(AnchorY - box.Y0, box.Y1 - AnchorY));
+
+        // 与 ViewFrame / 位移归一化完全同一口径：中心取「本体框中心」，阈值取「未归一化绝对框」的 8%
+        float bcx = (BodyBounds.MinX + BodyBounds.MaxX) * 0.5f;
+        float bcy = (BodyBounds.MinY + BodyBounds.MaxY) * 0.5f;
+        float thX = Math.Max(1e-3f, RawBounds.MaxX - RawBounds.MinX) * ViewFrame.DriftThresholdRatio;
+        float thY = Math.Max(1e-3f, RawBounds.MaxY - RawBounds.MinY) * ViewFrame.DriftThresholdRatio;
+
+        foreach (var anim in Data.Animations)
+        {
+            if (!runtimeBox.TryGetValue(anim.Name, out var rt)) continue;
+            var st = setupBox.TryGetValue(anim.Name, out var sv) ? sv : rt;
+
+            var fit = new AnimFit
+            {
+                Name = anim.Name,
+                SetupWidth = st.X1 - st.X0,
+                RuntimeWidth = rt.X1 - rt.X0,
+                CenterOffsetX = ((rt.X0 + rt.X1) - (st.X0 + st.X1)) * 0.5f,
+                CenterOffsetY = ((rt.Y0 + rt.Y1) - (st.Y0 + st.Y1)) * 0.5f,
+            };
+
+            if (runtimeFrames.TryGetValue(anim.Name, out var list))
+            {
+                foreach (var f in list)
+                {
+                    float cx = (f.X0 + f.X1) * 0.5f;
+                    float dx = Math.Abs(cx - bcx) > thX ? bcx - cx : 0f;   // 与 ViewFrame 一致：只补 X
+                    float dy = 0f;
+
+                    float px0 = f.X0 + dx, px1 = f.X1 + dx;
+                    float py0 = f.Y0, py1 = f.Y1;
+
+                    fit.PeakNeedW = Math.Max(fit.PeakNeedW, Math.Max(AnchorX - px0, px1 - AnchorX));
+                    fit.PeakNeedH = Math.Max(fit.PeakNeedH, Math.Max(AnchorY - py0, py1 - AnchorY));
+
+                    float over = Math.Max(Math.Max(box.X0 - px0, px1 - box.X1),
+                                          Math.Max(box.Y0 - py0, py1 - box.Y1));
+                    if (over > fit.ClipUnits) fit.ClipUnits = over;
+
+                    if (Math.Abs(dx) > 15f || Math.Abs(dy) > 15f) fit.DriftedFrames++;
+                    if (Math.Abs(dx) > fit.MaxDriftX) fit.MaxDriftX = Math.Abs(dx);
+                    if (Math.Abs(dy) > fit.MaxDriftY) fit.MaxDriftY = Math.Abs(dy);
+                }
+                fit.FrameCount = list.Count;
+            }
+
+            fit.PeakRatioW = fit.PeakNeedW / statHalfW;
+            fit.PeakRatioH = fit.PeakNeedH / statHalfH;
+            _fit.Add(fit);
+        }
+    }
+
+    /// <summary>待机类动画名（idle 优先，其次 posture，再退第一个）。</summary>
+    private string PickBodyAnimationName()
+    {
+        var a = Data.FindAnimation("idle") ?? Data.FindAnimation("posture");
+        if (a != null) return a.Name;
+        foreach (var b in Data.Animations) return b.Name;
+        return "";
+    }
+
+    /// <summary>「常驻状态」动画：它们是角色的本体，用来算本体框和 Drift 参照。</summary>
+    private static bool IsBodyAnimation(string name) =>
+        name is "idle" or "channel_idle" or "posture" or "sleep" or "giga_idle";
+
+    /// <summary>取一只骨骼当前所有可见附件的顶点包围盒。</summary>
+    internal static (float X0, float Y0, float X1, float Y1)? BoxOf(Skeleton skel)
+    {
+        float x0 = float.MaxValue, y0 = float.MaxValue;
+        float x1 = float.MinValue, y1 = float.MinValue;
+
+        foreach (var slot in skel.DrawOrder)
+        {
+            if (slot.Attachment is not VertexAttachment va || va.WorldVerticesLength < 2) continue;
+
+            var verts = new float[va.WorldVerticesLength];
+            va.ComputeWorldVertices(slot, verts);
+            for (int i = 0; i + 1 < verts.Length; i += 2)
+            {
+                if (verts[i] < x0) x0 = verts[i];
+                if (verts[i] > x1) x1 = verts[i];
+                if (verts[i + 1] < y0) y0 = verts[i + 1];
+                if (verts[i + 1] > y1) y1 = verts[i + 1];
+            }
+        }
+
+        return x0 <= x1 && y0 <= y1 ? (x0, y0, x1, y1) : null;
+    }
+
+    /// <summary>四边各按宽高的比例外扩一点。</summary>
+    private static (float X0, float Y0, float X1, float Y1) Expand(
+        (float X0, float Y0, float X1, float Y1) b, float ratio)
+    {
+        float dx = (b.X1 - b.X0) * ratio;
+        float dy = (b.Y1 - b.Y0) * ratio;
+        return (b.X0 - dx, b.Y0 - dy, b.X1 + dx, b.Y1 + dy);
+    }
+
+    private static (float X0, float Y0, float X1, float Y1) Union(
+        List<(float X0, float Y0, float X1, float Y1)> list)
+    {
+        float x0 = float.MaxValue, y0 = float.MaxValue;
+        float x1 = float.MinValue, y1 = float.MinValue;
+        foreach (var f in list)
         {
             if (f.X0 < x0) x0 = f.X0;
             if (f.Y0 < y0) y0 = f.Y0;
             if (f.X1 > x1) x1 = f.X1;
             if (f.Y1 > y1) y1 = f.Y1;
         }
-
-        // 分位框：砍掉最极端的各 10% 帧
-        var q = QuantileBox(frames);
-
-        float aw = Math.Max(1e-3f, x1 - x0), ah = Math.Max(1e-3f, y1 - y0);
-        float qw = Math.Max(1e-3f, q.X1 - q.X0), qh = Math.Max(1e-3f, q.Y1 - q.Y0);
-
-        // 静态框一律用分位框。
-        //
-        // 程和光三套素材的「绝对框 / 分位框」比值是 1.36 ~ 2.22 倍：die 会整只向左躺出
-        // 三倍身宽，313703 的 idle 里还有几帧甩出很远的道具。一旦改用绝对框，30% 的
-        // 画布面积都被这些少数帧占着，角色会被缩成「画面里的一小只」。
-        //
-        // 用分位框的代价是这些少数帧会超出静态框 —— 交给 PetRenderControl 的动态视框
-        // 兜（扩张立即生效、收缩延迟 1 秒，MaxExpand 已按这三套素材的峰值定到 3.0）。
-        // 窗口是透明的，扩张时用户看不到边框，只看到动作完整播完。
-        Logger.Log($"[Bounds] 绝对框 {aw:0}×{ah:0}／分位框 {qw:0}×{qh:0}"
-                 + $"（外扩 {aw / qw:0.00}× / {ah / qh:0.00}×），静态框取分位框");
-
-        LogBoundsDiagnosis(frames, q.X0, q.Y0, q.X1, q.Y1);
-        return q;
+        return x0 <= x1 ? (x0, y0, x1, y1) : (0f, 0f, 0f, 0f);
     }
 
     /// <summary>

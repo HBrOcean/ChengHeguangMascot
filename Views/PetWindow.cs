@@ -113,9 +113,16 @@ public class PetWindow : Window
         PlayIntro();
     }
 
+    /// <summary>当前屏幕缩放下的期望尺寸（DIP，已量化到整数物理像素）。</summary>
+    private Size DesiredSizeNow()
+    {
+        double sc = RenderScaling > 0 ? RenderScaling : 1.0;
+        return _pet.GetDesiredSize(sc);
+    }
+
     private void ApplySize()
     {
-        var s = _pet.DesiredPetSize;
+        var s = DesiredSizeNow();
         _pet.Width = s.Width;
         _pet.Height = s.Height;
         Width = s.Width;
@@ -132,7 +139,7 @@ public class PetWindow : Window
     /// </summary>
     private void ApplySizeKeepingBottom()
     {
-        var s = _pet.DesiredPetSize;
+        var s = DesiredSizeNow();
 
         // 首次布局完成前 Position/Width 还是 NaN，直接量尺寸即可。
         if (double.IsNaN(Width) || double.IsNaN(Height)) { ApplySize(); return; }
@@ -148,7 +155,7 @@ public class PetWindow : Window
     private void LogSize(string tag)
     {
         var b = _model.Bounds;
-        var s = _pet.DesiredPetSize;
+        var s = DesiredSizeNow();
         Logger.Log($"[Size] {tag} 包围盒 {b.MaxX - b.MinX:0}×{b.MaxY - b.MinY:0}"
                  + $"（x {b.MinX:0}..{b.MaxX:0}, y {b.MinY:0}..{b.MaxY:0}）"
                  + $" 锚点 ({_model.AnchorX:0},{_model.AnchorY:0})"
@@ -234,7 +241,8 @@ public class PetWindow : Window
             _pet.DynamicView = false;
             _pet.ResetView();          // 视框立刻回到静态包围盒
             _sizeTimer.Stop();
-            ResizeKeepingAnchor(_pet.DesiredPetSize.Width, _pet.DesiredPetSize.Height);
+            var fallback = DesiredSizeNow();
+            ResizeKeepingAnchor(fallback.Width, fallback.Height);
         }
     }
 
@@ -251,7 +259,7 @@ public class PetWindow : Window
         if (_pressed) return;      // 拖动过程中改尺寸会和人抢，手感会抖
         if (!IsVisible) return;
 
-        var s = _pet.DesiredPetSize;
+        var s = DesiredSizeNow();
 
         // 小于 2 DIP 的变化不动窗口，避免一直在 resize
         if (Math.Abs(s.Width - Width) < 2 && Math.Abs(s.Height - Height) < 2) return;
@@ -274,10 +282,15 @@ public class PetWindow : Window
 
         double sc = RenderScaling > 0 ? RenderScaling : 1.0;
 
-        int oldPxW = (int)Math.Ceiling(Width * sc);
-        int oldPxH = (int)Math.Ceiling(Height * sc);
-        int newPxW = (int)Math.Ceiling(w * sc);
-        int newPxH = (int)Math.Ceiling(h * sc);
+        // 统一量化：DIP 先 Snap 到整数物理像素，再由 DIP/pixel 反算回 DIP。
+        // 两处（窗口尺寸 / canvas 尺寸）都用 Round，连续 resize 才不会差 1px。
+        w = PetRenderControl.SnapDip(w, sc);
+        h = PetRenderControl.SnapDip(h, sc);
+
+        int oldPxW = (int)Math.Round(Width * sc, MidpointRounding.AwayFromZero);
+        int oldPxH = (int)Math.Round(Height * sc, MidpointRounding.AwayFromZero);
+        int newPxW = (int)Math.Round(w * sc, MidpointRounding.AwayFromZero);
+        int newPxH = (int)Math.Round(h * sc, MidpointRounding.AwayFromZero);
         if (newPxW < 1 || newPxH < 1) return;
 
         // 锚点取「底边中点」而不是窗口中心：

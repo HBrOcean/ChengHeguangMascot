@@ -26,6 +26,13 @@ internal static class Program
             return;
         }
 
+        // 体检：--fit 纯计算，输出「动作是否出窗 / 待机窗口会不会动」的表格
+        if (args.Length > 0 && args[0] == "--fit")
+        {
+            FitTool.Run(allSkins: args.Contains("--all", StringComparer.OrdinalIgnoreCase));
+            return;
+        }
+
         // 单实例保护：已有实例在运行则通知它现身，不要静默退出
         using var mutex = new Mutex(true, SingleInstanceName, out bool createdNew);
         if (!createdNew)
